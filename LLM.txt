@@ -1,0 +1,621 @@
+#Install required libraries (for Kaggle)
+!pip install datasets optax jax flax ipywidgets jupyter tabulate --quiet
+
+import os
+import json
+from tqdm import tqdm
+import numpy as np
+import jax
+import jax.numpy as jnp
+import flax.linen as nn
+import flax.serialization
+from flax.training import train_state
+import optax
+from datasets import load_dataset, concatenate_datasets, Dataset
+from tokenizers import Tokenizer
+from concurrent.futures import ThreadPoolExecutor
+from tabulate import tabulate
+
+# JAX/TPU memory configs
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "1.0"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+
+CTX_LEN = 2048
+
+# Model hyperparameters (must match previous runs)
+d_model = 768
+nhead = 12
+NUM_KV_HEADS = nhead // 2
+num_layers = 21
+ff_hidden_dim = d_model * 4
+dropout_rate = 0.0
+learning_rate = 8.88e-5
+
+# Tokenizer paths
+TOKENIZER_PATH = "/kaggle/input/m1-tokenizer/modified_tokenizer.json"
+TOKENIZER_CONFIG_PATH = "/kaggle/input/m1-tokenizer/config.json"
+with open(TOKENIZER_CONFIG_PATH, "r") as f:
+    tokenizer_config = json.load(f)
+vocab_size = tokenizer_config.get("vocab_size", 49804)
+
+moe_aux_loss_coef = 0.01
+
+# Layer indices assignment
+moe_layer_indices = []
+coe_layer_indices = []
+tf_layer_indices = []
+for i in range(num_layers):
+    if i % 3 == 0:
+        moe_layer_indices.append(i)
+    elif i % 3 == 1:
+        coe_layer_indices.append(i)
+    else:
+        tf_layer_indices.append(i)
+window_layer_indices = []
+
+devices = jax.devices()
+tpu_devices = [d for d in devices if d.platform == "tpu"]
+if not tpu_devices:
+    raise RuntimeError("TPU not found. Please set your runtime to TPU mode.")
+n_devices = len(tpu_devices)
+GLOBAL_BATCH_SIZE = 24
+if GLOBAL_BATCH_SIZE % n_devices != 0:
+    raise ValueError("Global batch size must be divisible by TPU devices.")
+LOCAL_BATCH_SIZE = GLOBAL_BATCH_SIZE // n_devices
+
+dense_init = nn.initializers.normal(stddev=0.02)
+
+class RMSNorm(nn.Module):
+    epsilon: float = 1e-05
+    dtype: any = jnp.bfloat16
+    @nn.compact
+    def __call__(self, x):
+        dim = x.shape[-1]
+        scale = self.param("scale", nn.initializers.ones, (dim,))
+        norm = jnp.sqrt(jnp.mean(x**2, axis=-1, keepdims=True) + self.epsilon)
+        return (x / norm) * scale
+
+class RoPE(nn.Module):
+    d_model: int
+    max_len: int
+    dtype: any = jnp.bfloat16
+    def setup(self):
+        self.inv_freq = 1.0 / (10000.0 ** (jnp.arange(0, self.d_model, 2, dtype=jnp.float32) / self.d_model))
+    def __call__(self, x):
+        seq_len = x.shape[-2]
+        pos = jnp.arange(seq_len, dtype=jnp.float32)[None, None, :, None]
+        inv_freq = self.inv_freq[None, None, None, :]
+        freqs = pos * inv_freq
+        cos = jnp.cos(freqs).astype(self.dtype)
+        sin = jnp.sin(freqs).astype(self.dtype)
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        return jnp.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos], axis=-1)
+
+class FeedForward(nn.Module):
+    d_model: int
+    hidden_dim: int
+    dropout_rate: float
+    dtype: any = jnp.bfloat16
+    @nn.compact
+    def __call__(self, x, deterministic=True):
+        proj = nn.Dense(self.hidden_dim * 2, use_bias=False, kernel_init=dense_init, dtype=self.dtype)(x)
+        x1, x2 = jnp.split(proj, 2, axis=-1)
+        x_act = x1 * nn.silu(x2)
+        x_act = nn.Dense(self.d_model, use_bias=False, kernel_init=dense_init, dtype=self.dtype)(x_act)
+        return nn.Dropout(rate=self.dropout_rate)(x_act, deterministic=deterministic)
+
+class ExpertFFN(nn.Module):
+    d_model: int
+    hidden_dim: int
+    dropout_rate: float
+    dtype: any = jnp.bfloat16
+    @nn.compact
+    def __call__(self, x, deterministic=True):
+        hidden = nn.Dense(self.hidden_dim, use_bias=False, kernel_init=dense_init, dtype=self.dtype)(x)
+        hidden = nn.silu(hidden)
+        out = nn.Dense(self.d_model, use_bias=False, kernel_init=dense_init, dtype=self.dtype)(hidden)
+        return out
+
+class MoEFeedForward(nn.Module):
+    d_model: int
+    hidden_dim: int
+    dropout_rate: float
+    num_experts: int = 5
+    num_experts_per_tok: int = 2
+    dtype: any = jnp.bfloat16
+    @nn.compact
+    def __call__(self, x, deterministic=True):
+        B, T, _ = x.shape
+        gate_logits = nn.Dense(self.num_experts, use_bias=False, dtype=self.dtype)(x)
+        topk_values, topk_indices = jax.lax.top_k(gate_logits, self.num_experts_per_tok)
+        sparse_gate_scores = jax.nn.softmax(topk_values, axis=-1)
+        full_sparse_gates = jnp.zeros((B, T, self.num_experts), dtype=x.dtype)
+        full_sparse_gates = full_sparse_gates.at[:, :, topk_indices].set(sparse_gate_scores)
+        importance = jnp.sum(full_sparse_gates, axis=1)
+        mean_importance = jnp.mean(importance, axis=1, keepdims=True)
+        load_loss = jnp.mean((importance - mean_importance)**2) / (jnp.mean(mean_importance)**2 + 1e-8)
+        self.sow("losses", "moe_aux_loss", load_loss)
+        expert_ffn = nn.vmap(ExpertFFN,
+                             variable_axes={'params': 0},
+                             split_rngs={'params': True},
+                             in_axes=0,
+                             out_axes=0)(d_model=self.d_model,
+                                         hidden_dim=self.hidden_dim,
+                                         dropout_rate=self.dropout_rate,
+                                         dtype=self.dtype)
+        x_expert = jnp.broadcast_to(x, (self.num_experts,) + x.shape)
+        experts_outputs = expert_ffn(x_expert)
+        experts_outputs = jnp.transpose(experts_outputs, (1, 2, 0, 3))
+        topk_indices_exp = jnp.expand_dims(topk_indices, axis=-1)
+        selected_expert_outputs = jnp.take_along_axis(experts_outputs, topk_indices_exp, axis=2)
+        sparse_gate_scores_exp = jnp.expand_dims(sparse_gate_scores, axis=-1)
+        moe_output = jnp.sum(selected_expert_outputs * sparse_gate_scores_exp, axis=2)
+        moe_output = nn.Dropout(rate=self.dropout_rate)(moe_output, deterministic=deterministic)
+        return moe_output
+class ChainOfExpertsModule(nn.Module):
+    d_model: int
+    hidden_dim: int
+    dropout_rate: float
+    num_experts: int = 2
+    num_forward_steps: int = 3
+    num_reflection_steps: int = 2
+    dtype: any = jnp.bfloat16
+    def setup(self):
+        self.experts = [ExpertFFN(d_model=self.d_model, hidden_dim=self.hidden_dim,
+                                   dropout_rate=self.dropout_rate, dtype=self.dtype, name=f"expert_{i}")
+                        for i in range(self.num_experts)]
+        self.conductor = nn.Dense(self.num_experts, use_bias=False, dtype=self.dtype)
+        self.reducer = nn.Dense(self.d_model, use_bias=False, dtype=self.dtype)
+        self.gate_layer = nn.Dense(1, use_bias=True, dtype=self.dtype)
+        self.reflection_dense1 = nn.Dense(self.d_model, dtype=self.dtype)
+        self.reflection_dense2 = nn.Dense(self.d_model, dtype=self.dtype)
+    def __call__(self, x, deterministic=True):
+        summary = jnp.mean(x, axis=1)
+        local_gate = nn.sigmoid(self.gate_layer(summary))
+        comments = []
+        current_state = x
+        for _ in range(self.num_forward_steps):
+            s = jnp.mean(current_state, axis=1)
+            logits = self.conductor(s)
+            gating = nn.softmax(logits, axis=-1)
+            expert_outputs = []
+            for expert in self.experts:
+                out = expert(current_state, deterministic=deterministic)
+                expert_outputs.append(out)
+            combined = jnp.sum(jnp.stack(expert_outputs, axis=0) *
+                               jnp.transpose(gating, (1, 0))[:, :, None, None], axis=0)
+            comments.append(combined)
+            current_state = current_state + combined
+        comments_stack = jnp.stack(comments, axis=0)
+        summarized_comments = jnp.mean(comments_stack, axis=0)
+        output = self.reducer(summarized_comments)
+        refined = output
+        num_reflection = min(self.num_reflection_steps, len(comments))
+        for i in range(num_reflection):
+            last_comment = comments[-(i+1)]
+            correction = self.reflection_dense1(last_comment)
+            correction = nn.relu(correction)
+            correction = self.reflection_dense2(correction)
+            refined = refined + correction
+        refined = refined * local_gate[:, None, :]
+        return x + refined
+
+class LLaMAAttention(nn.Module):
+    d_model: int
+    nhead: int
+    num_kv_heads: int
+    dropout_rate: float
+    dtype: any = jnp.bfloat16
+    use_sliding_window: bool = False
+    window_size: int = 1024
+    def setup(self):
+        self.head_dim = self.d_model // self.nhead
+        self.q_proj = nn.Dense(self.d_model, use_bias=False, kernel_init=dense_init, dtype=self.dtype)
+        self.kv_proj = nn.Dense(2 * (self.num_kv_heads * self.head_dim),
+                                use_bias=False, kernel_init=dense_init, dtype=self.dtype)
+        self.out_proj = nn.Dense(self.d_model, use_bias=False, kernel_init=dense_init, dtype=self.dtype)
+        self.dropout = nn.Dropout(rate=self.dropout_rate)
+        self.rope = RoPE(d_model=self.head_dim, max_len=CTX_LEN, dtype=self.dtype)
+        self.layer_scale_attn = self.param("layer_scale_attn", nn.initializers.constant(0.1), (self.d_model,))
+    def __call__(self, x, deterministic=True):
+        B, T, _ = x.shape
+        q = self.q_proj(x).reshape(B, T, self.nhead, self.head_dim)
+        kv = self.kv_proj(x).reshape(B, T, self.num_kv_heads, 2 * self.head_dim)
+        k, v = jnp.split(kv, 2, axis=-1)
+        group_factor = self.nhead // self.num_kv_heads
+        k = jnp.repeat(k, repeats=group_factor, axis=2)
+        v = jnp.repeat(v, repeats=group_factor, axis=2)
+        q = jnp.transpose(q, (0, 2, 1, 3))
+        k = jnp.transpose(k, (0, 2, 1, 3))
+        q = self.rope(q)
+        k = self.rope(k)
+        q = jnp.transpose(q, (0, 2, 1, 3))
+        k = jnp.transpose(k, (0, 2, 1, 3))
+        attn_weights = jnp.einsum("bthd,bThd->bthT", q, k) / jnp.sqrt(self.head_dim)
+        mask = jnp.tril(jnp.ones((T, T), dtype=bool))[None, :, None, :]
+        attn_weights = jnp.where(mask, attn_weights, -1e10)
+        attn_probs = nn.softmax(attn_weights, axis=-1)
+        attn_probs = self.dropout(attn_probs, deterministic=deterministic)
+        attn_output = jnp.einsum("bthT,bThd->bthd", attn_probs, v)
+        attn_output = attn_output.reshape(B, T, self.d_model)
+        output = self.out_proj(attn_output)
+        output = self.dropout(output, deterministic=deterministic)
+        return output * self.layer_scale_attn
+
+class TransformerLayer(nn.Module):
+    d_model: int
+    nhead: int
+    ff_hidden_dim: int
+    dropout_rate: float
+    dtype: any = jnp.bfloat16
+    use_sliding_window: bool = False
+    window_size: int = 1024
+    ff_type: str = "feedforward"
+    moe_params: dict = None
+    coe_params: dict = None
+    def setup(self):
+        self.attn_norm = RMSNorm(dtype=self.dtype)
+        self.attn = LLaMAAttention(
+            d_model=self.d_model,
+            nhead=self.nhead,
+            num_kv_heads=NUM_KV_HEADS,
+            dropout_rate=self.dropout_rate,
+            dtype=self.dtype,
+            use_sliding_window=False,
+            window_size=self.window_size
+        )
+        self.ff_norm = RMSNorm(dtype=self.dtype)
+        if self.ff_type=="chain":
+            self.ff = ChainOfExpertsModule(
+                d_model=self.d_model,
+                hidden_dim=self.ff_hidden_dim,
+                dropout_rate=self.dropout_rate,
+                num_experts=self.coe_params.get("num_experts", 2),
+                num_forward_steps=self.coe_params.get("num_forward_steps", 3),
+                num_reflection_steps=self.coe_params.get("num_reflection_steps", 2),
+                dtype=self.dtype
+            )
+        elif self.ff_type=="moe":
+            self.ff = MoEFeedForward(
+                d_model=self.d_model,
+                hidden_dim=self.ff_hidden_dim,
+                dropout_rate=self.dropout_rate,
+                num_experts=self.moe_params.get("num_experts", 5),
+                num_experts_per_tok=self.moe_params.get("num_experts_per_tok",2),
+                dtype=self.dtype
+            )
+        else:
+            self.ff = FeedForward(
+                d_model=self.d_model,
+                hidden_dim=self.ff_hidden_dim,
+                dropout_rate=self.dropout_rate,
+                dtype=self.dtype
+            )
+        self.layer_scale_ff = self.param("layer_scale_ff", nn.initializers.constant(0.1), (self.d_model,))
+    def __call__(self, x, deterministic=True):
+        x = x + self.attn(self.attn_norm(x), deterministic=deterministic)
+        x = x + self.ff(self.ff_norm(x), deterministic=deterministic) * self.layer_scale_ff
+        return x
+class CelestiaModel(nn.Module):
+    vocab_size: int
+    d_model: int
+    nhead: int
+    num_layers: int
+    ff_hidden_dim: int
+    max_len: int
+    dropout_rate: float
+    dtype: any = jnp.bfloat16
+    window_layer_indices: list = None
+    moe_layer_indices: list = None
+    chain_expert_layer_indices: list = None
+    window_size: int = 1024
+    moe_params: dict = None
+    coe_params: dict = None
+    def setup(self):
+        self.embed = nn.Embed(num_embeddings=self.vocab_size,
+                              features=self.d_model,
+                              embedding_init=dense_init,
+                              dtype=self.dtype)
+        layers = []
+        for i in range(self.num_layers):
+            if i in self.moe_layer_indices:
+                ff_type = "moe"
+                layer_moe_params = {"num_experts": 5, "num_experts_per_tok": 2}
+                layer_coe_params = {}
+            elif i in self.chain_expert_layer_indices:
+                ff_type = "chain"
+                layer_moe_params = {}
+                layer_coe_params = {"num_experts": 2, "num_forward_steps": 3, "num_reflection_steps": 2}
+            else:
+                ff_type = "feedforward"
+                layer_moe_params = {}
+                layer_coe_params = {}
+            layers.append(
+                TransformerLayer(
+                    d_model=self.d_model,
+                    nhead=self.nhead,
+                    ff_hidden_dim=self.ff_hidden_dim,
+                    dropout_rate=self.dropout_rate,
+                    dtype=self.dtype,
+                    use_sliding_window=False,
+                    window_size=self.window_size,
+                    ff_type=ff_type,
+                    moe_params=layer_moe_params,
+                    coe_params=layer_coe_params,
+                )
+            )
+        self.layers = layers
+        self.norm = RMSNorm(dtype=self.dtype)
+    def __call__(self, input_ids, deterministic=True):
+        x = self.embed(input_ids)
+        for layer in self.layers:
+            x = layer(x, deterministic=deterministic)
+        x = self.norm(x)
+        logits = x @ self.embed.embedding.T
+        return logits
+
+# -------------- Tokenizer (load new tokenizer) --------------
+tokenizer = Tokenizer.from_file(TOKENIZER_PATH)
+PAD_TOKEN_ID = tokenizer.token_to_id("<pad>")
+SOS_TOKEN_ID = tokenizer.token_to_id("<startoftext>")
+EOS_TOKEN_ID = tokenizer.token_to_id("<endoftext>")
+
+def preprocess_text(example):
+    text = None
+    if "text" in example and example["text"]:
+        text = str(example["text"]).strip()
+    elif "code" in example and example["code"]:
+        text = str(example["code"]).strip()
+    else:
+        input_ids = np.full((CTX_LEN - 1,), PAD_TOKEN_ID, dtype=np.int32)
+        target_ids = np.full((CTX_LEN - 1,), PAD_TOKEN_ID, dtype=np.int32)
+        return input_ids, target_ids
+
+    if not text:
+        input_ids = np.full((CTX_LEN - 1,), PAD_TOKEN_ID, dtype=np.int32)
+        target_ids = np.full((CTX_LEN - 1,), PAD_TOKEN_ID, dtype=np.int32)
+        return input_ids, target_ids
+
+    full_text = "<startoftext> " + text + " <endoftext>"
+    raw_token_ids = tokenizer.encode(full_text).ids
+    raw_token_ids = raw_token_ids[:CTX_LEN]
+    if len(raw_token_ids) < CTX_LEN:
+        raw_token_ids += [PAD_TOKEN_ID] * (CTX_LEN - len(raw_token_ids))
+
+    input_ids = np.array(raw_token_ids[:-1], dtype=np.int32)
+    target_ids = np.array(raw_token_ids[1:], dtype=np.int32)
+    return input_ids, target_ids
+
+def data_generator(dataset, batch_size, limit, max_workers=32):
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = []
+        batch_inp, batch_tgt = [], []
+        count = 0
+        for example in dataset:
+            if count >= limit:
+                break
+            futures.append(executor.submit(preprocess_text, example))
+            count += 1
+            if len(futures) >= batch_size:
+                for fut in futures:
+                    inp, tgt = fut.result()
+                    batch_inp.append(inp)
+                    batch_tgt.append(tgt)
+                yield np.stack(batch_inp), np.stack(batch_tgt)
+                futures, batch_inp, batch_tgt = [], [], []
+        if futures:
+            for fut in futures:
+                inp, tgt = fut.result()
+                batch_inp.append(inp)
+                batch_tgt.append(tgt)
+            yield np.stack(batch_inp), np.stack(batch_tgt)
+
+CODE_LANGUAGES = set([
+    "Python", "JavaScript", "TypeScript", "Java",
+    "C", "C++", "C#", "Go", "Shell", "Bash", "HTML", "CSS", "SQL"
+])
+CODE_LANGUAGES_LOWER = set([x.lower() for x in CODE_LANGUAGES])
+HUMAN_LANGUAGES = set([
+    "English", "Arabic", "French", "German", "Spanish",
+    "Italian", "Polish", "Greek", "Latin"
+])
+HUMAN_LANGUAGES_LOWER = set([x.lower() for x in HUMAN_LANGUAGES])
+
+def filter_github_code_duplicate(row):
+    lang = row.get("language")
+    if lang is None or str(lang).strip() == "" or str(lang).lower() in CODE_LANGUAGES_LOWER:
+        return True
+    lang_norm = str(lang).replace(" ", "").replace("#", "sharp").replace("++", "pp").lower()
+    code_norms = [x.replace(" ", "").replace("#", "sharp").replace("++", "pp").lower() for x in CODE_LANGUAGES]
+    return lang_norm in code_norms
+
+def filter_common_corpus(row):
+    lang = row.get("language")
+    if lang is None or str(lang).strip() == "":
+        return True
+    lang_str = str(lang)
+    if lang_str.lower() in CODE_LANGUAGES_LOWER or lang_str.lower() in HUMAN_LANGUAGES_LOWER:
+        return True
+    return False
+
+
+print("Loading and streaming GitHub Code Duplicate dataset...")
+ghcode_file = "https://huggingface.co/datasets/loubnabnl/github-code-duplicate/resolve/main/data/train-00000-of-01812.parquet"
+ghcode_streamed = load_dataset("parquet", data_files={"data": ghcode_file}, split="data", streaming=True)
+filtered_ghcode = []
+pbar = tqdm(desc="Filtering ghcode", unit=" rows", total=1_500_000)
+for row in ghcode_streamed:
+    if filter_github_code_duplicate(row):
+        filtered_ghcode.append({"code": row["code"]})
+    if len(filtered_ghcode) % 10000 == 0:
+        pbar.update(10000)
+    if len(filtered_ghcode) >= 1_000_000:
+        break
+pbar.close()
+print(f"Filtered GitHub code rows: {len(filtered_ghcode)}")
+
+print("Loading and streaming Common Corpus dataset...")
+commoncorpus_file9 = "https://huggingface.co/datasets/PleIAs/common_corpus/resolve/main/common_corpus_1/subset_99_9.parquet"
+commoncorpus_streamed9 = load_dataset("parquet", data_files={"data": commoncorpus_file9}, split="data", streaming=True)
+filtered_commoncorpus9 = []
+pbar = tqdm(desc="Filtering commoncorpus file", unit=" rows", total=1_500_000)
+for row in commoncorpus_streamed9:
+    if filter_common_corpus(row):
+        filtered_commoncorpus9.append({"text": row["text"]})
+    if len(filtered_commoncorpus9) % 10000 == 0:
+        pbar.update(10000)
+    if len(filtered_commoncorpus9) >= 1_000_000:
+        break
+pbar.close()
+print(f"Filtered common corpus file rows: {len(filtered_commoncorpus9)}")
+
+print("Loading Finemath-4plus dataset file...")
+finemath_file5 = "https://huggingface.co/datasets/HuggingFaceTB/finemath/resolve/main/finemath-4plus/train-00000-of-00064.parquet"
+finemath_ds5 = load_dataset("parquet", data_files={"data": finemath_file5}, split="data").select_columns(["text"])
+
+print("Loading FineWeb-edu dataset (last 50% of file)...")
+fineweb_file3 = "https://huggingface.co/datasets/HuggingFaceFW/fineweb-edu/resolve/main/data/CC-MAIN-2013-20/train-00000-of-00014.parquet"
+fineweb_raw3 = load_dataset("parquet", data_files={"data": fineweb_file3}, split="data").select_columns(["text"])
+half_len3 = len(fineweb_raw3) // 2
+fineweb_ds3_last_half = fineweb_raw3.select(range(half_len3, len(fineweb_raw3)))  # Use last half only
+
+print("Loading FineWeb-2 dataset ...")
+fineweb2_file = "https://huggingface.co/datasets/HuggingFaceFW/fineweb-2/resolve/main/data/hin_Latn/train/000_00000.parquet"
+fineweb2_raw = load_dataset("parquet", data_files={"data": fineweb2_file}, split="data").select_columns(["text"])
+fineweb2_ds_next5k = fineweb2_raw.select(range(50000, min(55000, len(fineweb2_raw))))
+
+print("Loading Common Corpus dataset...")
+commoncorpus_file10 = "https://huggingface.co/datasets/PleIAs/common_corpus/resolve/main/common_corpus_1/subset_99_10.parquet"
+commoncorpus_streamed10 = load_dataset("parquet", data_files={"data": commoncorpus_file10}, split="data", streaming=True)
+filtered_commoncorpus10 = []
+pbar = tqdm(desc="Filtering commoncorpus file", unit=" rows", total=1_500_000)
+for row in commoncorpus_streamed10:
+    if filter_common_corpus(row):
+        filtered_commoncorpus10.append({"text": row["text"]})
+    if len(filtered_commoncorpus10) % 10000 == 0:
+        pbar.update(10000)
+    if len(filtered_commoncorpus10) >= 1_000_000:
+        break
+pbar.close()
+print(f"Filtered common corpus file rows: {len(filtered_commoncorpus10)}")
+
+#------------------- COMBINE ALL DATASETS -------------------
+print("Combining datasets...")
+ghcode_ds = Dataset.from_list(filtered_ghcode)
+commoncorpus_ds9 = Dataset.from_list(filtered_commoncorpus9)
+commoncorpus_ds10 = Dataset.from_list(filtered_commoncorpus10)
+combined_ds = concatenate_datasets([
+    finemath_ds5, ghcode_ds, fineweb_ds3_last_half, fineweb2_ds_next5k, commoncorpus_ds9, commoncorpus_ds10
+]).shuffle(seed=9)
+train_examples = combined_ds.num_rows
+steps_per_epoch = train_examples // GLOBAL_BATCH_SIZE
+
+def compute_loss_and_metrics(params, batch, rng, deterministic):
+    inputs, targets = batch
+    outputs, updated_vars = model.apply(params, inputs, deterministic=deterministic,
+                                        mutable=["losses"],
+                                        rngs={'dropout': rng} if not deterministic else None)
+    logits = outputs
+    aux_loss = updated_vars.get("losses", {}).get("moe_aux_loss", 0.0)
+    one_hot = jax.nn.one_hot(targets, vocab_size)
+    mask = (targets != PAD_TOKEN_ID).astype(jnp.float32)
+    loss_main = jnp.sum(optax.softmax_cross_entropy(logits, one_hot) * mask) / jnp.maximum(jnp.sum(mask), 1e-8)
+    loss_total = loss_main + moe_aux_loss_coef * aux_loss
+    perplexity = jnp.exp(loss_main)
+    preds = jnp.argmax(logits, axis=-1)
+    accuracy = jnp.sum((preds == targets) * mask) / jnp.maximum(jnp.sum(mask), 1e-8)
+    return loss_total, loss_main, aux_loss, perplexity, accuracy
+
+def train_step(state, batch, rng):
+    def loss_fn(params):
+        loss_total, _, _, _, _ = compute_loss_and_metrics(params, batch, rng, deterministic=False)
+        return loss_total
+    loss_total, grads = jax.value_and_grad(loss_fn)(state.params)
+    state = state.apply_gradients(grads=grads)
+    loss_total, loss_main, aux_loss, perplexity, acc = compute_loss_and_metrics(state.params, batch, rng, deterministic=False)
+    return state, loss_total, loss_main, aux_loss, perplexity, acc
+
+p_train_step = jax.pmap(train_step, axis_name="batch")
+
+model = CelestiaModel(
+    vocab_size=vocab_size,
+    d_model=d_model,
+    nhead=nhead,
+    num_layers=num_layers,
+    ff_hidden_dim=ff_hidden_dim,
+    max_len=CTX_LEN,
+    dropout_rate=dropout_rate,
+    dtype=jnp.bfloat16,
+    window_layer_indices=window_layer_indices,
+    moe_layer_indices=moe_layer_indices,
+    chain_expert_layer_indices=coe_layer_indices,
+    window_size=1024,
+    moe_params={"num_experts": 5, "num_experts_per_tok": 2},
+    coe_params={"num_experts": 2, "num_forward_steps": 3, "num_reflection_steps": 2},
+)
+
+# Initialize model from base instead of loading from checkpoint
+print("Initializing model parameters from base...")
+init_rng = jax.random.PRNGKey(0)
+init_rng, dropout_rng = jax.random.split(init_rng)
+init_input = jnp.ones((LOCAL_BATCH_SIZE, CTX_LEN - 1), dtype=jnp.int32)
+
+# Show model summary using flax model.tabulate
+print("\nModel Summary:")
+print(model.tabulate({'params': init_rng, 'dropout': dropout_rng}, init_input, 
+                     console_kwargs={'width': 200, 'force_terminal': True}))
+
+params = model.init({'params': init_rng, 'dropout': dropout_rng}, init_input, deterministic=False)
+
+state = train_state.TrainState.create(
+    apply_fn=model.apply,
+    params=params,
+    tx=optax.chain(
+        optax.clip_by_global_norm(1.0),
+        optax.adam(learning_rate)
+    )
+)
+state = jax.device_put_replicated(state, tpu_devices)
+
+NUM_EPOCHS = 1
+global_step = 0
+
+print("\nIncremental Training (Step 1) using all TPU devices...")
+for epoch in range(NUM_EPOCHS):
+    print(f"\nEpoch {epoch + 1}/{NUM_EPOCHS}")
+    train_gen = data_generator(combined_ds, GLOBAL_BATCH_SIZE, train_examples, max_workers=32)
+    pbar = tqdm(range(steps_per_epoch))
+    for _ in pbar:
+        try:
+            batch_inputs, batch_targets = next(train_gen)
+        except StopIteration:
+            break
+        batch_inputs = jnp.array(batch_inputs)
+        batch_targets = jnp.array(batch_targets)
+        batch = (batch_inputs.reshape((n_devices, LOCAL_BATCH_SIZE, -1)),
+                 batch_targets.reshape((n_devices, LOCAL_BATCH_SIZE, -1)))
+        rng = jax.random.PRNGKey(global_step)
+        step_rngs = jax.random.split(rng, n_devices)
+        state, loss_total, loss_main, aux_loss, perplexity, acc = p_train_step(state, batch, step_rngs)
+        global_step += 1
+        avg_loss = float(jnp.mean(loss_total))
+        avg_loss_main = float(jnp.mean(loss_main))
+        avg_aux_loss = float(jnp.mean(aux_loss))
+        avg_perplexity = float(jnp.mean(perplexity))
+        avg_acc = float(jnp.mean(acc))
+        pbar.set_postfix({
+            "Total Loss": f"{avg_loss:.4f}",
+            "Main Loss": f"{avg_loss_main:.4f}",
+            "Aux Loss": f"{avg_aux_loss:.4f}",
+            "Perplexity": f"{avg_perplexity:.2f}",
+            "Acc": f"{avg_acc:.4f}"
+        })
+
+print("Incremental training step 1 complete.")
+params_single = jax.tree_util.tree_map(lambda x: x[0], state.params)
+output_file = "celestia_scratch_step1.msgpack"
+with open(output_file, "wb") as f:
+    f.write(flax.serialization.to_bytes(params_single))
+print(f"\nModel parameters saved to: {output_file}")
